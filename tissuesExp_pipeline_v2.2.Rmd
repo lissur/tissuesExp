@@ -1,0 +1,1771 @@
+---
+title: "tissuesExp pipeline"
+author: "Lissur Orsine"
+date: "27/02/2021"
+output: html_document
+---
+
+<!-- Be aware that overwrite = TRUE, which means that every time you run the pipeline, the tables are updated in the database -->
+
+## 1. Chunks global options
+```{r, setup, include = FALSE}
+knitr::opts_chunk$set(include = TRUE, echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+## 2. Libraries
+```{r, libraries}
+library(RMySQL)
+library(e1071) # For kurtosis and skewness calculation
+```
+
+## 3. Pipeline variables
+```{r, pipeline_variables}
+# R
+rnaseqExpDir = "/home/lissur/cellsExp_db/"
+rnaseqExpName = "breast_cancer"
+rnaseqExpCode = "E-MTAB-4801"
+
+pipelineDir = "/home/lissur/cellsExp_pipeline/"
+
+database = "cellsExp"
+
+# bash
+Sys.setenv(rnaseqExpDir = rnaseqExpDir, rnaseqExpName = rnaseqExpName, rnaseqExpCode = rnaseqExpCode)
+```
+
+## 4. Chunks variables
+```{r, chunks_variables}
+consideringOutliers = "yes"
+fence = "inner"
+
+# For chunk HERD
+o_score_ts_score <- list(c(1,25),
+                         c(2,25),
+                         c(3,25),
+                         c(4,25),
+                         c(5,25),
+                         c(1,50),
+                         c(2,50),
+                         c(3,50),
+                         c(4,50),
+                         c(5,50))
+```
+
+## 5. Download data
+```{bash, download_data}
+# tsv
+echo -e "Downloading tsv for $rnaseqExpName...\n"
+urltsv="https://www.ebi.ac.uk/gxa/experiments-content/$rnaseqExpCode/resources/ExperimentDownloadSupplier.RnaSeqBaseline/tpms.tsv"
+outputFiletsv="${rnaseqExpDir}${rnaseqExpName}.tsv"
+wget --no-check-certificate $urltsv -O $outputFiletsv
+echo "Download completed for $rnaseqExpName!"
+```
+
+## 6. Download metadata
+```{bash, download_metadata}
+echo -e "Downloading metadata for $rnaseqExpName...\n"
+urlmetadata="https://www.ebi.ac.uk/gxa/experiments-content/$rnaseqExpCode/resources/ExperimentDesignFile.Baseline/experiment-design"
+outputFilemetadata="${rnaseqExpDir}${rnaseqExpName}_metadata.tsv"
+wget --no-check-certificate $urlmetadata -O $outputFilemetadata
+echo "Download completed for $rnaseqExpName!"
+```
+
+## 7. Create database
+```{r, create_database}
+# Login into mysql as root user and grant all privileges on the new database to your user before creating the database itself (e.g.: GRANT ALL PRIVILEGES ON cellsExp.* TO 'hep'@'localhost';)
+# Definition for group clientother (i.e. user and password) in file /etc/my.cnf
+
+# Create database
+con <- dbConnect(MySQL(), group = "clientother")
+dbGetQuery(con, paste0("create database if not exists ", database,";"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con)
+```
+
+## 8. TPM
+```{r, tpm}
+# tsv
+# Import data
+tpm <- read.table(paste0(rnaseqExpDir, rnaseqExpName, ".tsv"),
+          header = TRUE,
+          sep = "\t",
+          quote = "")
+
+# Adjust columns'names to SQL pattern (i.e. replace dot by underscore)
+tissues <- colnames(tpm)
+tissues <- gsub('\\.', '_', tissues)
+colnames(tpm) <- tissues
+
+# Put columns into alphabetical order and remove Gene Name column
+tissues <- tissues[3:length(tissues)]
+tpm <- tpm[,c("Gene_ID", sort(tissues))]
+
+# Replace NA/NULL by ZERO
+tpm[is.na(tpm)] <- 0
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con,
+             paste0(rnaseqExpName, "_tpm_gxa"),
+             tpm,
+             row.names = FALSE,
+             overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_tpm_gxa change Gene_ID ensembl varchar(15) primary key"))
+
+# Copy tpm_gxa to tpm
+dbGetQuery(con, paste0("DROP TABLE IF EXISTS `", rnaseqExpName, "_tpm`"))
+dbGetQuery(con, paste0("CREATE TABLE ", rnaseqExpName, "_tpm LIKE ", rnaseqExpName, "_tpm_gxa"))
+dbGetQuery(con, paste0("INSERT INTO ", rnaseqExpName, "_tpm SELECT * FROM ", rnaseqExpName, "_tpm_gxa"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tissues)
+```
+
+## 9. TPM max
+```{r, tpm_max}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+dbDisconnect(con)
+
+# Prepare output
+tpm_max <- data.frame(ensembl = tpm$ensembl,
+                      tpm_max = rep(0, nrow(tpm)),
+                      tpm_max_tissue = rep(NA, nrow(tpm)),
+                      stringsAsFactors = FALSE)
+
+# Maximum TPM per gene
+for(i in 1:nrow(tpm)){
+  tpm_gene <- tpm[i,2:ncol(tpm)]
+  tpm_max[i,"tpm_max"] <- max(tpm_gene)
+  tpm_max[i,"tpm_max_tissue"] <- names(sort(tpm_gene)[length(tpm_gene)])
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_tpmMax_per_gene"), tpm_max, row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", tpm_max = "float", tpm_max_tissue = "varchar(34)"), overwrite = TRUE)
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_max, tpm_gene, i)
+```
+
+## 10. Metadata
+```{r, metadata}
+# tsv
+# Import data
+metadata <- read.table(paste0(rnaseqExpDir, rnaseqExpName, "_metadata.tsv"),
+                       header = TRUE,
+                       sep = "\t",
+                       quote = "",
+                       stringsAsFactors = FALSE)
+
+# Adjust columns'names to SQL pattern (i.e. replace dot by underscore)
+metadata_colnames <- colnames(metadata)
+metadata_colnames <- gsub("[.]$", "", metadata_colnames)
+metadata_colnames <- gsub("[.]", "_", metadata_colnames)
+colnames(metadata) <- metadata_colnames
+
+# Replace missing information by NA/NULL
+missing_metadata <- which(metadata=="", arr.ind = TRUE)
+for(i in 1:nrow(missing_metadata)){
+  missing_row <- missing_metadata[i,1]
+  missing_col <- missing_metadata[i,2]
+  metadata[missing_row,missing_col] <- NA
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(
+  con,
+  paste0(rnaseqExpName, "_metadata"),
+  metadata,
+  row.names = FALSE,
+  overwrite = TRUE
+)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_metadata change Run Run varchar(", max(nchar(metadata[,1])),") primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(metadata, metadata_colnames, i, missing_metadata, missing_row, missing_col, con)
+```
+
+## 11. Boxplot
+```{r, boxplot}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+# Prepare outputs
+boxplot_stats <- data.frame("ensembl" = tpm[,1],
+                            "lower_whisker"= rep(0, nrow(tpm)),
+                            "q1" = rep(0, nrow(tpm)),
+                            "q2" = rep(0, nrow(tpm)),
+                            "q3" = rep(0, nrow(tpm)),
+                            "upper_whisker" = rep(0, nrow(tpm)))
+
+outliers <- tpm_values
+outliers[,] <- 0
+
+# Boxplot
+for(i in 1:nrow(tpm)){
+  if(fence == "inner"){
+    result <- boxplot.stats(tpm_values[i,])
+  }else if(fence == "outer"){
+    result <- boxplot.stats(tpm_values[i,], coef = 3.0)
+  }else{
+    stop("Please provide fence option: inner or outer.")
+  }
+  boxplot_stats[i,2:6] <- result$stats
+}
+
+# Flag outliers
+outliers_low <- tpm_values < boxplot_stats[,2]
+outliers_up <- tpm_values > boxplot_stats[,6]
+
+outliers[which(outliers_low)] <- -1
+outliers[which(outliers_up)] <- 1
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_boxplot_stats_", fence, "_fence"), boxplot_stats, row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", lower_whisker = "float", q1 = "float", q2 = "float", q3 = "float", upper_whisker = "float"), overwrite = TRUE)
+dbWriteTable(con, paste0(rnaseqExpName, "_outliers_", fence, "_fence"), as.data.frame(outliers), overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_outliers_", fence, "_fence change row_names ensembl varchar(15) primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, boxplot_stats, result, i, outliers_up, outliers_low, outliers)
+```
+
+## 12. Outliers summary
+```{r, outliers_summary}
+# Import tables
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+outIF <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_inner_fence"))
+outOF <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_outer_fence"))
+dbDisconnect(con)
+
+# Tables parser
+outIF_values <- as.matrix(outIF[,2:ncol(outIF)])
+rownames(outIF_values) <- outIF[,1]
+outOF_values <- as.matrix(outOF[,2:ncol(outOF)])
+rownames(outOF_values) <- outOF[,1]
+
+# Prepare output
+outIFOF <- matrix(data = NA, nrow = nrow(outIF_values), ncol = ncol(outIF_values), byrow = FALSE, dimnames = list(rownames(outIF_values), colnames(outIF_values)))
+
+# Combine tables information
+# Ultra UP
+outIFOF[outIF_values == 1 & outOF_values == 1] <- 2
+# Ultra LOW
+outIFOF[outIF_values == -1 & outOF_values == -1] <- -2
+# Non-outliers
+outIFOF[outIF_values == 0 & outOF_values == 0] <- 0
+# Mild UP
+outIFOF[outIF_values == 1 & outOF_values == 0] <- 1
+# Mild LOW
+outIFOF[outIF_values == -1 & outOF_values == 0] <- -1
+
+# Write combined table into database
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_outliers_inner_outer_fences"), as.data.frame(outIFOF), overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_outliers_inner_outer_fences change row_names ensembl varchar(15) primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, outIF, outOF, outIF_values, outOF_values, outIFOF)
+```
+
+## 13. All non-outliers list
+```{r, all_non_outliers_list, eval = FALSE, purl=FALSE}
+# -- encode
+# create table tmp_encode_nonOutliers
+# select ensembl
+# from encode_outliers_inner_outer_fences
+# where
+# adipose_tissue=0 and
+# adrenal_gland=0 and
+# brain=0 and
+# heart=0 and
+# kidney=0 and
+# liver=0 and
+# lung=0 and
+# ovary=0 and
+# pancreas=0 and
+# sigmoid_colon=0 and
+# small_intestine=0 and
+# spleen=0 and
+# testis=0;
+# 
+# -- fantom
+# create table tmp_fantom_nonOutliers
+# select ensembl
+# from fantom_outliers_inner_outer_fences
+# where
+# amygdala=0 and
+# artery=0 and
+# bone_marrow=0 and
+# brain=0 and
+# brain_meninx=0 and
+# breast=0 and
+# caudate_nucleus=0 and
+# cerebellum=0 and
+# colon=0 and
+# diencephalon=0 and
+# dorsal_thalamus=0 and
+# dura_mater=0 and
+# epididymis=0 and
+# gall_bladder=0 and
+# globus_pallidus=0 and
+# heart=0 and
+# heart_left_ventricle=0 and
+# hippocampal_formation=0 and
+# kidney=0 and
+# left_cardiac_atrium=0 and
+# locus_ceruleus=0 and
+# lung=0 and
+# lymph_node=0 and
+# medulla_oblongata=0 and
+# middle_frontal_gyrus=0 and
+# middle_temporal_gyrus=0 and
+# mitral_valve=0 and
+# occipital_cortex=0 and
+# occipital_lobe=0 and
+# olfactory_apparatus=0 and
+# ovary=0 and
+# pancreas=0 and
+# parietal_lobe=0 and
+# parotid_gland=0 and
+# penis=0 and
+# pineal_body=0 and
+# pituitary_gland=0 and
+# placenta=0 and
+# prostate_gland=0 and
+# pulmonary_valve=0 and
+# putamen=0 and
+# seminal_vesicle=0 and
+# smooth_muscle_tissue=0 and
+# spinal_cord=0 and
+# spleen=0 and
+# submandibular_gland=0 and
+# substantia_nigra=0 and
+# testis=0 and
+# tongue=0 and
+# tricuspid_valve=0 and
+# uterine_cervix=0 and
+# uterus=0 and
+# vagina=0 and
+# vas_deferens=0 and
+# vermiform_appendix=0 and
+# zone_of_skin=0;
+# 
+# -- gtex
+# create table tmp_gtex_nonOutliers
+# select ensembl
+# from gtex_outliers_inner_outer_fences
+# where
+# adrenal_gland=0 and
+# amygdala=0 and
+# aorta=0 and
+# atrium_auricular_region=0 and
+# blood=0 and
+# breast=0 and
+# Brodmann_1909_area_24=0 and
+# Brodmann_1909_area_9=0 and
+# C1_segment_of_cervical_spinal_cord=0 and
+# caudate_nucleus=0 and
+# cerebellar_hemisphere=0 and
+# cerebellum=0 and
+# cerebral_cortex=0 and
+# coronary_artery=0 and
+# cortex_of_kidney=0 and
+# EBV_transformed_lymphocyte=0 and
+# ectocervix=0 and
+# endocervix=0 and
+# esophagogastric_junction=0 and
+# esophagus_mucosa=0 and
+# esophagus_muscularis_mucosa=0 and
+# fallopian_tube=0 and
+# greater_omentum=0 and
+# heart_left_ventricle=0 and
+# hippocampus_proper=0 and
+# hypothalamus=0 and
+# liver=0 and
+# lower_leg_skin=0 and
+# lung=0 and
+# minor_salivary_gland=0 and
+# nucleus_accumbens=0 and
+# ovary=0 and
+# pancreas=0 and
+# pituitary_gland=0 and
+# prostate_gland=0 and
+# putamen=0 and
+# sigmoid_colon=0 and
+# skeletal_muscle_tissue=0 and
+# small_intestine_Peyers_patch=0 and
+# spleen=0 and
+# stomach=0 and
+# subcutaneous_adipose_tissue=0 and
+# substantia_nigra=0 and
+# suprapubic_skin=0 and
+# testis=0 and
+# thyroid_gland=0 and
+# tibial_artery=0 and
+# tibial_nerve=0 and
+# transformed_skin_fibroblast=0 and
+# transverse_colon=0 and
+# urinary_bladder=0 and
+# uterus=0 and
+# vagina=0;
+# 
+# -- hpa
+# create table tmp_hpa_nonOutliers
+# select ensembl
+# from hpa_outliers_inner_outer_fences
+# where
+# adipose_tissue=0 and
+# adrenal_gland=0 and
+# bone_marrow=0 and
+# cerebral_cortex=0 and
+# colon=0 and
+# duodenum=0 and
+# endometrium=0 and
+# esophagus=0 and
+# fallopian_tube=0 and
+# gall_bladder=0 and
+# heart=0 and
+# kidney=0 and
+# liver=0 and
+# lung=0 and
+# lymph_node=0 and
+# ovary=0 and
+# pancreas=0 and
+# placenta=0 and
+# prostate_gland=0 and
+# rectum=0 and
+# saliva_secreting_gland=0 and
+# skeletal_muscle_tissue=0 and
+# small_intestine=0 and
+# smooth_muscle_tissue=0 and
+# spleen=0 and
+# stomach=0 and
+# testis=0 and
+# thyroid_gland=0 and
+# tonsil=0 and
+# urinary_bladder=0 and
+# vermiform_appendix=0 and
+# zone_of_skin=0;
+# 
+# -- ibm
+# create table tmp_ibm_nonOutliers
+# select ensembl
+# from ibm_outliers_inner_outer_fences
+# where
+# adipose_tissue=0 and
+# adrenal_gland=0 and
+# brain=0 and
+# breast=0 and
+# colon=0 and
+# heart=0 and
+# kidney=0 and
+# leukocyte=0 and
+# liver=0 and
+# lung=0 and
+# lymph_node=0 and
+# ovary=0 and
+# prostate_gland=0 and
+# skeletal_muscle_tissue=0 and
+# testis=0 and
+# thyroid_gland=0;
+# 
+# -- all_non_outliers table
+# create table all_non_outliers
+# select g.ensembl
+# from
+# (select e.ensembl
+# from
+# (select c.ensembl
+# from
+# (select a.ensembl
+# from
+# (select ensembl from tmp_encode_nonOutliers) a
+# join
+# (select ensembl from tmp_fantom_nonOutliers) b
+# on a.ensembl=b.ensembl) c
+# join
+# (select ensembl from tmp_gtex_nonOutliers) d
+# on c.ensembl=d.ensembl) e
+# join
+# (select ensembl from tmp_hpa_nonOutliers) f
+# on e.ensembl=f.ensembl) g
+# join
+# (select ensembl from tmp_ibm_nonOutliers) h
+# on g.ensembl=h.ensembl;
+# 
+# drop table tmp_encode_nonOutliers, tmp_fantom_nonOutliers, tmp_gtex_nonOutliers, tmp_hpa_nonOutliers, tmp_ibm_nonOutliers;
+```
+
+## 14. Outliers count (per gene)
+```{r, outliers_count}
+# In this script, we are dealing only with upper inner outliers; that means, outliers table (outliers_values object) contains only upper inner outliers (to check, use "apply(outliers_values, 2, unique)")
+
+# Import outliers and outliers_IFOF tables from database
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+outliers <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_inner_fence"))
+outliers_IFOF <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_inner_outer_fences"))
+dbDisconnect(con)
+
+# Parse outliers and outliers_IFOF tables to matrix
+outliers_values <- as.matrix(outliers[,2:ncol(outliers)])
+rownames(outliers_values) <- outliers[,1]
+
+outliers_IFOF_values <- as.matrix(outliers_IFOF[,2:ncol(outliers_IFOF)])
+rownames(outliers_IFOF_values) <- outliers_IFOF[,1]
+
+# Remove lower inner outliers (i.e. replace by zero)
+outliers_values[which(outliers_values==-1)] <- 0
+
+outliers_IFOF_values[which(outliers_IFOF_values==-1)] <- 0
+outliers_IFOF_values[which(outliers_IFOF_values==-2)] <- 0
+
+# Prepare output
+outliersCount <- data.frame("ensembl" = outliers[,"ensembl"],
+                            "OutIF" = rep(0, nrow(outliers)),
+                            "OutOF" = rep(0, nrow(outliers)),
+                            "OutTotal" = rep(0, nrow(outliers)),
+                            "tissues_OutIF" = rep(NA, nrow(outliers)),
+                            "tissues_OutOF" = rep(NA, nrow(outliers)),
+                            "tissues_OutTotal" = rep(NA, nrow(outliers)))
+
+# Count total upper inner outliers per gene
+for(i in 1:nrow(outliers_IFOF_values)){
+  outliersCount[i,"OutTotal"] <- length(which(outliers_values[i,]==1))
+  outliersCount[i,"OutIF"] <- length(which(outliers_IFOF_values[i,]==1))
+  outliersCount[i,"OutOF"] <- length(which(outliers_IFOF_values[i,]==2))
+  
+  if(outliersCount[i,"OutTotal"]!=0){
+    outliersCount[i,"tissues_OutTotal"] <- paste(colnames(outliers_values)[which(outliers_values[i,]==1)], collapse = ", ")
+  }else{
+    outliersCount[i,"tissues_OutTotal"] <- "None"
+  }
+  
+  if(outliersCount[i,"OutIF"]!=0){
+    outliersCount[i,"tissues_OutIF"] <- paste(colnames(outliers_IFOF_values)[which(outliers_IFOF_values[i,]==1)], collapse = ", ")
+  }else{
+    outliersCount[i,"tissues_OutIF"] <- "None"
+  }
+  
+  if(outliersCount[i,"OutOF"]!=0){
+    outliersCount[i,"tissues_OutOF"] <- paste(colnames(outliers_IFOF_values)[which(outliers_IFOF_values[i,]==2)], collapse = ", ")
+  }else{
+    outliersCount[i,"tissues_OutOF"] <- "None"
+  }
+}
+
+# Export table outliersCount
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_outliers_count_per_gene"), outliersCount,
+             row.names = FALSE,
+             field.types = c(ensembl = "varchar(15) primary key",
+                             OutIF = "tinyint unsigned",
+                             OutOF = "tinyint unsigned",
+                             OutTotal = "tinyint unsigned",
+                             tissues_OutIF = "varchar(1000)",
+                             tissues_OutOF = "varchar(1000)",
+                             tissues_OutTotal = "varchar(1000)"),
+             overwrite = TRUE)
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, outliers, outliers_values, outliers_IFOF, outliers_IFOF_values, outliersCount, i)
+```
+
+## 15. Average and Standard deviation
+```{r, avg_std}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+if(consideringOutliers == "no"){
+ outliers <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_", fence, "_fence"), row.names = "ensembl")
+}
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+if(consideringOutliers == "no"){
+  outliers <- as.matrix(outliers)
+  tpm_values[which(outliers != 0)] <- NA
+}
+
+# Average
+average <- function(x){
+  mean(x, na.rm = TRUE)
+}
+
+avg <- apply(tpm_values, 1, average)
+avg <- as.data.frame(avg)
+
+# Standard deviation
+standard_deviation <- function(x){
+  sd(x, na.rm = TRUE)
+}
+
+std <- apply(tpm_values, 1, standard_deviation)
+std <- as.data.frame(std)
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+if(consideringOutliers == "yes"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_avg"), avg, row.names = TRUE, field.types = c(row_names = "varchar(15)", avg = "float"), overwrite = TRUE)
+  dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_avg change row_names ensembl varchar(15) primary key"))
+  dbWriteTable(con, paste0(rnaseqExpName, "_std"), std, row.names = TRUE, field.types = c(row_names = "varchar(15)", std = "float"), overwrite = TRUE)
+  dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_std change row_names ensembl varchar(15) primary key"))
+}
+if(consideringOutliers == "no"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_avg_without_outliers_", fence, "_fence"), avg, row.names = TRUE, field.types = c(row_names = "varchar(15)", avg = "float"), overwrite = TRUE)
+  dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_avg_without_outliers_", fence, "_fence change row_names ensembl varchar(15) primary key"))
+  dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_avg_without_outliers_", fence, "_fence change avg avg_without_outliers float"))
+  dbWriteTable(con, paste0(rnaseqExpName, "_std_without_outliers_", fence, "_fence"), std, row.names = TRUE, field.types = c(row_names = "varchar(15)", std = "float"), overwrite = TRUE)
+  dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_std_without_outliers_", fence, "_fence change row_names ensembl varchar(15) primary key"))
+  dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_std_without_outliers_", fence, "_fence change std std_without_outliers float"))
+}
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, outliers, average, avg, standard_deviation, std)
+```
+
+## 16. Normality test
+```{r, normality_test}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+if(consideringOutliers == "no"){
+ outliers <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_", fence, "_fence"), row.names = "ensembl")
+}
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+if(consideringOutliers == "no"){
+  outliers <- as.matrix(outliers)
+  tpm_values[which(outliers != 0)] <- NA
+}
+
+# Prepare output
+normality_test <- data.frame("ensembl" = tpm[,1],
+                             "sw_stat" = rep(0, nrow(tpm)),
+                             "sw_pvalue" = rep(0, nrow(tpm)),
+                             "support" = rep(0, nrow(tpm)),
+                             "sw_result" = rep(0, nrow(tpm)))
+
+# Normality test
+# Conditions for the Shapiro-Wilk test of normality:
+# (Look at the shapiro.test function source code to check the conditions)
+# The number of non-missing values must be between 3 and 5000 (3 <= n <= 5000; only the first limit is checked in this script as the second limit is unlikely to occur)
+# The non-missing values must not be identical (rng != 0)
+for(i in 1:nrow(tpm)){
+  x <- tpm_values[i,]
+  x <- sort(x[complete.cases(x)])
+  n <- length(x)
+  rng <- x[n] - x[1L]
+  if(n >= 3L && rng != 0){
+    result <- shapiro.test(x)
+    normality_test[i,2] <- result$statistic
+    normality_test[i,3] <- result$p.value
+    normality_test[i,4] <- n
+    if(result$p.value>0.05){normality_test[i,5] <- 1}
+  }else{
+    normality_test[i,2:5] <- NA
+  }
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+if(consideringOutliers == "yes"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_normality_test"), normality_test, row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", sw_stat = "float", sw_pvalue = "float", support = "int", sw_result = "tinyint"), overwrite = TRUE)
+}
+if(consideringOutliers == "no"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_normality_test_without_outliers_", fence, "_fence"), normality_test, row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", sw_stat = "float", sw_pvalue = "float", support = "int", sw_result = "tinyint"), overwrite = TRUE)
+}
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, outliers, normality_test, i, x, n, rng, result)
+```
+
+## 17. Uniformity test
+```{r, uniformity_test}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+if(consideringOutliers == "no"){
+ outliers <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_", fence, "_fence"), row.names = "ensembl")
+}
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+if(consideringOutliers == "no"){
+  outliers <- as.matrix(outliers)
+  tpm_values[which(outliers != 0)] <- NA
+}
+
+# Prepare output
+uniformity_test <- data.frame("ensembl" = tpm[,1],
+                              "ks_stat"= rep(0, nrow(tpm)),
+                              "ks_pvalue" = rep(0, nrow(tpm)),
+                              "support" = rep(0, nrow(tpm)),
+                              "ks_result" = rep(0, nrow(tpm)))
+
+# Uniformity test
+# Conditions for the Kolmogorov-Smirnov test of uniformity:
+# (See "Details" in the ks.test help documentation)
+# When ties (i.e. repeated values) are present, both statistic and p.value are NA
+for(i in 1:nrow(tpm)){
+  expression <- tpm_values[i,]
+  n <- length(which(!is.na(expression)))
+  out <- which(is.na(expression))
+  if(consideringOutliers == "no" && length(out) != 0){
+    expression <- expression[-out]
+  }
+  result <- ks.test(expression, "punif", min(expression), max(expression))
+  if(!is.na(result$p.value)){
+    uniformity_test[i,2] <- result$statistic
+    uniformity_test[i,3] <- result$p.value
+    uniformity_test[i,4] <- n
+    if(result$p.value>0.05){uniformity_test[i,5] <- 1}
+  }else{
+    uniformity_test[i,2:5] <- NA
+  }
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+if(consideringOutliers == "yes"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_uniformity_test"), uniformity_test, row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", ks_stat = "float", ks_pvalue = "float", support = "int", ks_result = "tinyint"), overwrite = TRUE)
+}
+if(consideringOutliers == "no"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_uniformity_test_without_outliers_", fence, "_fence"), uniformity_test, row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", ks_stat = "float", ks_pvalue = "float", support = "int", ks_result = "tinyint"), overwrite = TRUE)
+}
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, outliers, uniformity_test, i, n, expression, out, result)
+```
+
+## 18. "Zeros" counting
+```{r, zeros_counting}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+# Prepare output
+zeros_counting <- data.frame("ensembl" = tpm[,1],
+                             "zeros_counting"= rep(0, nrow(tpm)),
+                             "zeros_counting_result" = rep(0, nrow(tpm)))
+
+# "Zeros" counting
+for(i in 1:nrow(tpm)){
+  zeros_counting[i,2] <- length(which(tpm_values[i,]==0))
+  if(NCOL(tpm_values) %% 2 != 0 & zeros_counting[i,2]>=round(0.75*NCOL(tpm_values))){zeros_counting[i,3] <- 1} # Odd number of tissues in the database
+  if(NCOL(tpm_values) %% 2 == 0 & zeros_counting[i,2]>=(round(0.75*NCOL(tpm_values))+1)){zeros_counting[i,3] <- 1} # Even number of tissues in the database
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_zeros_counting"), zeros_counting, row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", zeros_counting = "int", zeros_counting_result = "tinyint"), overwrite = TRUE)
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, zeros_counting, i)
+```
+
+## 19. Tests summary
+```{r, tests_summary}
+# This script is considering only inner fence
+# sw_stat, sw_pvalue and support to be considered are those in the normality_test_summary table (and not those in normality_test or normality_test_without_outliers_inner_fence tables)
+# sw_stat, sw_pvalue and support came from the first application of the normality test (data from normality_test table) only for pG; for all the other, they came from the second application of the normality test (data from normality_test_without_outliers_inner_fence table)
+
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+normality_test <- dbReadTable(con, paste0(rnaseqExpName, "_normality_test"))
+normality_test_without_outliers_inner_fence <- dbReadTable(con, paste0(rnaseqExpName, "_normality_test_without_outliers_inner_fence"))
+
+uniformity_test <- dbReadTable(con, paste0(rnaseqExpName, "_uniformity_test"))
+uniformity_test_without_outliers_inner_fence <- dbReadTable(con, paste0(rnaseqExpName, "_uniformity_test_without_outliers_inner_fence"))
+
+zeros_counting <- dbReadTable(con, paste0(rnaseqExpName, "_zeros_counting"))
+dbDisconnect(con)
+
+# normality_test and normality_test_without_outliers_inner_fence
+normality_test_summary <- normality_test
+
+normality_test_summary[which(normality_test$sw_result==1),] <- normality_test[which(normality_test$sw_result==1),] # Não é necessário (tabela normality_test_summary é igual à tabela normality_test neste ponto), mas melhor manter por segurança
+normality_test_summary[which(normality_test$sw_result==1),"sw_result"] <- "pG"
+
+normality_test_summary[which(normality_test$sw_result==0 & normality_test_without_outliers_inner_fence$sw_result==1),] <- normality_test_without_outliers_inner_fence[which(normality_test$sw_result==0 & normality_test_without_outliers_inner_fence$sw_result==1),]
+normality_test_summary[which(normality_test$sw_result==0 & normality_test_without_outliers_inner_fence$sw_result==1),"sw_result"] <- "cG"
+
+normality_test_summary[which(normality_test$sw_result==0 & normality_test_without_outliers_inner_fence$sw_result==0),] <- normality_test_without_outliers_inner_fence[which(normality_test$sw_result==0 & normality_test_without_outliers_inner_fence$sw_result==0),]
+normality_test_summary[which(normality_test$sw_result==0 & normality_test_without_outliers_inner_fence$sw_result==0),"sw_result"] <- "nonG"
+
+normality_test_summary[which(normality_test$sw_result==0 & is.na(normality_test_without_outliers_inner_fence$sw_result)),] <- normality_test_without_outliers_inner_fence[which(normality_test$sw_result==0 & is.na(normality_test_without_outliers_inner_fence$sw_result)),]
+normality_test_summary[which(normality_test$sw_result==0 & is.na(normality_test_without_outliers_inner_fence$sw_result)),"sw_result"] <- NA # Não é necessário (linha inteira é NULL), mas melhor manter por segurança
+
+# uniformity_test and uniformity_test_without_outliers_inner_fence
+uniformity_test_summary <- uniformity_test
+
+uniformity_test_summary[which(uniformity_test$ks_result==1),] <- uniformity_test[which(uniformity_test$ks_result==1),] # Não é necessário (tabela uniformity_test_summary é igual à tabela uniformity_test neste ponto), mas melhor manter por segurança
+uniformity_test_summary[which(uniformity_test$ks_result==1),"ks_result"] <- "pU"
+
+uniformity_test_summary[which(uniformity_test$ks_result==0 & uniformity_test_without_outliers_inner_fence$ks_result==1),] <- uniformity_test_without_outliers_inner_fence[which(uniformity_test$ks_result==0 & uniformity_test_without_outliers_inner_fence$ks_result==1),]
+uniformity_test_summary[which(uniformity_test$ks_result==0 & uniformity_test_without_outliers_inner_fence$ks_result==1),"ks_result"] <- "cU"
+
+uniformity_test_summary[which(uniformity_test$ks_result==0 & uniformity_test_without_outliers_inner_fence$ks_result==0),] <- uniformity_test_without_outliers_inner_fence[which(uniformity_test$ks_result==0 & uniformity_test_without_outliers_inner_fence$ks_result==0),]
+uniformity_test_summary[which(uniformity_test$ks_result==0 & uniformity_test_without_outliers_inner_fence$ks_result==0),"ks_result"] <- "nonU"
+
+# uniformity_test_summary[which(uniformity_test$ks_result==0 & is.na(uniformity_test_without_outliers_inner_fence$ks_result)),] <- uniformity_test_without_outliers_inner_fence[which(uniformity_test$ks_result==0 & is.na(uniformity_test_without_outliers_inner_fence$ks_result)),]
+# uniformity_test_summary[which(uniformity_test$ks_result==0 & is.na(uniformity_test_without_outliers_inner_fence$ks_result)),"ks_result"] <- NA # Não é necessário (linha inteira é NULL), mas melhor manter por segurança
+
+# zeros_counting
+zeros_counting_summary <- zeros_counting
+
+zeros_counting_summary[which(zeros_counting_summary$zeros_counting_result==1),"zeros_counting_result"] <- "cZ"
+zeros_counting_summary[which(zeros_counting_summary$zeros_counting_result==0),"zeros_counting_result"] <- "nonZ"
+
+# Tests summary table
+stats_tests <- merge(normality_test_summary, uniformity_test_summary, by = "ensembl", all = TRUE)
+tests_summary <- merge(stats_tests, zeros_counting_summary, by = "ensembl", all = TRUE)
+tests_summary <- tests_summary[,c("ensembl", "sw_result", "ks_result", "zeros_counting_result")]
+
+tests_summary[,"tests_result"] <- paste(tests_summary$sw_result, tests_summary$ks_result, tests_summary$zeros_counting_result, sep = "_")
+
+# Export tables
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_normality_test_summary"), normality_test_summary,
+	row.names = FALSE,
+	field.types = c(ensembl = "varchar(15) primary key", sw_stat = "float", sw_pvalue = "float", support = "int", sw_result = "varchar(5)"),
+	overwrite = TRUE)
+
+dbWriteTable(con, paste0(rnaseqExpName, "_uniformity_test_summary"), uniformity_test_summary,
+	row.names = FALSE,
+	field.types = c(ensembl = "varchar(15) primary key", ks_stat = "float", ks_pvalue = "float", support = "int", ks_result = "varchar(5)"),
+	overwrite = TRUE)
+
+dbWriteTable(con, paste0(rnaseqExpName, "_zeros_counting_summary"), zeros_counting_summary,
+	row.names = FALSE,
+	field.types = c(ensembl = "varchar(15) primary key", zeros_counting = "int", zeros_counting_result = "varchar(5)"),
+	overwrite = TRUE)
+
+dbWriteTable(con, paste0(rnaseqExpName, "_tests_summary"), tests_summary,
+	row.names = FALSE,
+	field.types = c(ensembl = "varchar(15) primary key", sw_result = "varchar(5)", ks_result = "varchar(5)", zeros_counting_result = "varchar(5)", tests_result = "varchar(18)"),
+	overwrite = TRUE)
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, normality_test, normality_test_without_outliers_inner_fence, uniformity_test, uniformity_test_without_outliers_inner_fence, zeros_counting, normality_test_summary, uniformity_test_summary, zeros_counting_summary, stats_tests, tests_summary)
+```
+
+## 20. o-score
+```{r, oScore}
+# Rounding to 4 decimal places
+
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+boxplot_stats <- dbReadTable(con, paste0(rnaseqExpName, "_boxplot_stats_inner_fence"))
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+# Prepare outputs
+q3_values <- tpm_values
+iqr_values <- tpm_values
+
+oScore_values <- tpm_values
+
+# Calculate o-score
+for (i in 1:nrow(boxplot_stats)) {
+	q1 <- boxplot_stats$q1[i]
+	q3 <- boxplot_stats$q3[i]
+	iqr <- q3 - q1
+	q3_values[i,] <- q3
+	iqr_values[i,] <- iqr
+}
+
+oScore_values <- round((tpm_values - q3_values) / (1.5 * iqr_values), digits = 4)
+
+# Flag cases for whose iqr = 0 (or q1 = q3)
+oScore_values[which(rowSums(iqr_values)==0),] <- NA
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_oScore"), as.data.frame(oScore_values), overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_oScore change row_names ensembl varchar(15) primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, boxplot_stats, i, q1, q3, iqr, q3_values, iqr_values, oScore_values)
+```
+
+## 21. o-score max
+```{r, oScore_max}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+oScore <- dbReadTable(con, paste0(rnaseqExpName, "_oScore"))
+dbDisconnect(con)
+
+# Prepare output
+oScore_max <- data.frame(ensembl = oScore$ensembl,
+                         oScore_max = rep(0, nrow(oScore)),
+                         stringsAsFactors = FALSE)
+
+# Calculate o-score max
+oScore_max$oScore_max <- apply(oScore[,2:ncol(oScore)], 1, max)
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(
+  con,
+  paste0(rnaseqExpName, "_oScoreMax_per_gene"),
+  oScore_max,
+  field.types = c(ensembl = "varchar(15) primary key", oScore_max = "float"),
+  row.names = FALSE,
+  overwrite = TRUE
+)
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, oScore, oScore_max)
+```
+
+## 22. Fences
+```{r, fences}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+boxplot_stats <- dbGetQuery(con, paste0("select ensembl,q1,q3 from ", rnaseqExpName, "_boxplot_stats_inner_fence;"))
+dbDisconnect(con)
+
+# Prepare outputs
+boxplot_upper_fences <- matrix(data = 0, nrow = nrow(boxplot_stats), ncol = 103)
+rownames(boxplot_upper_fences) <- boxplot_stats$ensembl
+colnames(boxplot_upper_fences) <- c("q1", "q3", "iqr", "fence_1", "fence_2", "fence_3", "fence_4", "fence_5", "fence_6", "fence_7", "fence_8", "fence_9", "fence_10", "fence_11", "fence_12", "fence_13", "fence_14", "fence_15", "fence_16", "fence_17", "fence_18", "fence_19", "fence_20", "fence_21", "fence_22", "fence_23", "fence_24", "fence_25", "fence_26", "fence_27", "fence_28", "fence_29", "fence_30", "fence_31", "fence_32", "fence_33", "fence_34", "fence_35", "fence_36", "fence_37", "fence_38", "fence_39", "fence_40", "fence_41", "fence_42", "fence_43", "fence_44", "fence_45", "fence_46", "fence_47", "fence_48", "fence_49", "fence_50", "fence_51", "fence_52", "fence_53", "fence_54", "fence_55", "fence_56", "fence_57", "fence_58", "fence_59", "fence_60", "fence_61", "fence_62", "fence_63", "fence_64", "fence_65", "fence_66", "fence_67", "fence_68", "fence_69", "fence_70", "fence_71", "fence_72", "fence_73", "fence_74", "fence_75", "fence_76", "fence_77", "fence_78", "fence_79", "fence_80", "fence_81", "fence_82", "fence_83", "fence_84", "fence_85", "fence_86", "fence_87", "fence_88", "fence_89", "fence_90", "fence_91", "fence_92", "fence_93", "fence_94", "fence_95", "fence_96", "fence_97", "fence_98", "fence_99", "fence_100")
+
+boxplot_lower_fences <- matrix(data = 0, nrow = nrow(boxplot_stats), ncol = 103)
+rownames(boxplot_lower_fences) <- boxplot_stats$ensembl
+colnames(boxplot_lower_fences) <- c("q1", "q3", "iqr", "fence_1", "fence_2", "fence_3", "fence_4", "fence_5", "fence_6", "fence_7", "fence_8", "fence_9", "fence_10", "fence_11", "fence_12", "fence_13", "fence_14", "fence_15", "fence_16", "fence_17", "fence_18", "fence_19", "fence_20", "fence_21", "fence_22", "fence_23", "fence_24", "fence_25", "fence_26", "fence_27", "fence_28", "fence_29", "fence_30", "fence_31", "fence_32", "fence_33", "fence_34", "fence_35", "fence_36", "fence_37", "fence_38", "fence_39", "fence_40", "fence_41", "fence_42", "fence_43", "fence_44", "fence_45", "fence_46", "fence_47", "fence_48", "fence_49", "fence_50", "fence_51", "fence_52", "fence_53", "fence_54", "fence_55", "fence_56", "fence_57", "fence_58", "fence_59", "fence_60", "fence_61", "fence_62", "fence_63", "fence_64", "fence_65", "fence_66", "fence_67", "fence_68", "fence_69", "fence_70", "fence_71", "fence_72", "fence_73", "fence_74", "fence_75", "fence_76", "fence_77", "fence_78", "fence_79", "fence_80", "fence_81", "fence_82", "fence_83", "fence_84", "fence_85", "fence_86", "fence_87", "fence_88", "fence_89", "fence_90", "fence_91", "fence_92", "fence_93", "fence_94", "fence_95", "fence_96", "fence_97", "fence_98", "fence_99", "fence_100")
+
+# Calculate fences
+for (i in 1:nrow(boxplot_stats)) {
+	q1 <- boxplot_stats$q1[i]
+	q3 <- boxplot_stats$q3[i]
+	iqr <- (q3 - q1)
+
+	boxplot_upper_fences[i, "q1"] <- q1
+	boxplot_upper_fences[i, "q3"] <- q3
+	boxplot_upper_fences[i, "iqr"] <- iqr
+
+	boxplot_upper_fences[i, "fence_1"] <- q3 + (1.5*iqr)
+	boxplot_upper_fences[i, "fence_2"] <- q3 + (3*iqr)
+	boxplot_upper_fences[i, "fence_3"] <- q3 + (4.5*iqr)
+	boxplot_upper_fences[i, "fence_4"] <- q3 + (6*iqr)
+	boxplot_upper_fences[i, "fence_5"] <- q3 + (7.5*iqr)
+	boxplot_upper_fences[i, "fence_6"] <- q3 + (9*iqr)
+	boxplot_upper_fences[i, "fence_7"] <- q3 + (10.5*iqr)
+	boxplot_upper_fences[i, "fence_8"] <- q3 + (12*iqr)
+	boxplot_upper_fences[i, "fence_9"] <- q3 + (13.5*iqr)
+	boxplot_upper_fences[i, "fence_10"] <- q3 + (15*iqr)
+	boxplot_upper_fences[i, "fence_11"] <- q3 + (16.5*iqr)
+	boxplot_upper_fences[i, "fence_12"] <- q3 + (18*iqr)
+	boxplot_upper_fences[i, "fence_13"] <- q3 + (19.5*iqr)
+	boxplot_upper_fences[i, "fence_14"] <- q3 + (21*iqr)
+	boxplot_upper_fences[i, "fence_15"] <- q3 + (22.5*iqr)
+	boxplot_upper_fences[i, "fence_16"] <- q3 + (24*iqr)
+	boxplot_upper_fences[i, "fence_17"] <- q3 + (25.5*iqr)
+	boxplot_upper_fences[i, "fence_18"] <- q3 + (27*iqr)
+	boxplot_upper_fences[i, "fence_19"] <- q3 + (28.5*iqr)
+	boxplot_upper_fences[i, "fence_20"] <- q3 + (30*iqr)
+	boxplot_upper_fences[i, "fence_21"] <- q3 + (31.5*iqr)
+	boxplot_upper_fences[i, "fence_22"] <- q3 + (33*iqr)
+	boxplot_upper_fences[i, "fence_23"] <- q3 + (34.5*iqr)
+	boxplot_upper_fences[i, "fence_24"] <- q3 + (36*iqr)
+	boxplot_upper_fences[i, "fence_25"] <- q3 + (37.5*iqr)
+	boxplot_upper_fences[i, "fence_26"] <- q3 + (39*iqr)
+	boxplot_upper_fences[i, "fence_27"] <- q3 + (40.5*iqr)
+	boxplot_upper_fences[i, "fence_28"] <- q3 + (42*iqr)
+	boxplot_upper_fences[i, "fence_29"] <- q3 + (43.5*iqr)
+	boxplot_upper_fences[i, "fence_30"] <- q3 + (45*iqr)
+	boxplot_upper_fences[i, "fence_31"] <- q3 + (46.5*iqr)
+	boxplot_upper_fences[i, "fence_32"] <- q3 + (48*iqr)
+	boxplot_upper_fences[i, "fence_33"] <- q3 + (49.5*iqr)
+	boxplot_upper_fences[i, "fence_34"] <- q3 + (51*iqr)
+	boxplot_upper_fences[i, "fence_35"] <- q3 + (52.5*iqr)
+	boxplot_upper_fences[i, "fence_36"] <- q3 + (54*iqr)
+	boxplot_upper_fences[i, "fence_37"] <- q3 + (55.5*iqr)
+	boxplot_upper_fences[i, "fence_38"] <- q3 + (57*iqr)
+	boxplot_upper_fences[i, "fence_39"] <- q3 + (58.5*iqr)
+	boxplot_upper_fences[i, "fence_40"] <- q3 + (60*iqr)
+	boxplot_upper_fences[i, "fence_41"] <- q3 + (61.5*iqr)
+	boxplot_upper_fences[i, "fence_42"] <- q3 + (63*iqr)
+	boxplot_upper_fences[i, "fence_43"] <- q3 + (64.5*iqr)
+	boxplot_upper_fences[i, "fence_44"] <- q3 + (66*iqr)
+	boxplot_upper_fences[i, "fence_45"] <- q3 + (67.5*iqr)
+	boxplot_upper_fences[i, "fence_46"] <- q3 + (69*iqr)
+	boxplot_upper_fences[i, "fence_47"] <- q3 + (70.5*iqr)
+	boxplot_upper_fences[i, "fence_48"] <- q3 + (72*iqr)
+	boxplot_upper_fences[i, "fence_49"] <- q3 + (73.5*iqr)
+	boxplot_upper_fences[i, "fence_50"] <- q3 + (75*iqr)
+	boxplot_upper_fences[i, "fence_51"] <- q3 + (76.5*iqr)
+	boxplot_upper_fences[i, "fence_52"] <- q3 + (78*iqr)
+	boxplot_upper_fences[i, "fence_53"] <- q3 + (79.5*iqr)
+	boxplot_upper_fences[i, "fence_54"] <- q3 + (81*iqr)
+	boxplot_upper_fences[i, "fence_55"] <- q3 + (82.5*iqr)
+	boxplot_upper_fences[i, "fence_56"] <- q3 + (84*iqr)
+	boxplot_upper_fences[i, "fence_57"] <- q3 + (85.5*iqr)
+	boxplot_upper_fences[i, "fence_58"] <- q3 + (87*iqr)
+	boxplot_upper_fences[i, "fence_59"] <- q3 + (88.5*iqr)
+	boxplot_upper_fences[i, "fence_60"] <- q3 + (90*iqr)
+	boxplot_upper_fences[i, "fence_61"] <- q3 + (91.5*iqr)
+	boxplot_upper_fences[i, "fence_62"] <- q3 + (93*iqr)
+	boxplot_upper_fences[i, "fence_63"] <- q3 + (94.5*iqr)
+	boxplot_upper_fences[i, "fence_64"] <- q3 + (96*iqr)
+	boxplot_upper_fences[i, "fence_65"] <- q3 + (97.5*iqr)
+	boxplot_upper_fences[i, "fence_66"] <- q3 + (99*iqr)
+	boxplot_upper_fences[i, "fence_67"] <- q3 + (100.5*iqr)
+	boxplot_upper_fences[i, "fence_68"] <- q3 + (102*iqr)
+	boxplot_upper_fences[i, "fence_69"] <- q3 + (103.5*iqr)
+	boxplot_upper_fences[i, "fence_70"] <- q3 + (105*iqr)
+	boxplot_upper_fences[i, "fence_71"] <- q3 + (106.5*iqr)
+	boxplot_upper_fences[i, "fence_72"] <- q3 + (108*iqr)
+	boxplot_upper_fences[i, "fence_73"] <- q3 + (109.5*iqr)
+	boxplot_upper_fences[i, "fence_74"] <- q3 + (111*iqr)
+	boxplot_upper_fences[i, "fence_75"] <- q3 + (112.5*iqr)
+	boxplot_upper_fences[i, "fence_76"] <- q3 + (114*iqr)
+	boxplot_upper_fences[i, "fence_77"] <- q3 + (115.5*iqr)
+	boxplot_upper_fences[i, "fence_78"] <- q3 + (117*iqr)
+	boxplot_upper_fences[i, "fence_79"] <- q3 + (118.5*iqr)
+	boxplot_upper_fences[i, "fence_80"] <- q3 + (120*iqr)
+	boxplot_upper_fences[i, "fence_81"] <- q3 + (121.5*iqr)
+	boxplot_upper_fences[i, "fence_82"] <- q3 + (123*iqr)
+	boxplot_upper_fences[i, "fence_83"] <- q3 + (124.5*iqr)
+	boxplot_upper_fences[i, "fence_84"] <- q3 + (126*iqr)
+	boxplot_upper_fences[i, "fence_85"] <- q3 + (127.5*iqr)
+	boxplot_upper_fences[i, "fence_86"] <- q3 + (129*iqr)
+	boxplot_upper_fences[i, "fence_87"] <- q3 + (130.5*iqr)
+	boxplot_upper_fences[i, "fence_88"] <- q3 + (132*iqr)
+	boxplot_upper_fences[i, "fence_89"] <- q3 + (133.5*iqr)
+	boxplot_upper_fences[i, "fence_90"] <- q3 + (135*iqr)
+	boxplot_upper_fences[i, "fence_91"] <- q3 + (136.5*iqr)
+	boxplot_upper_fences[i, "fence_92"] <- q3 + (138*iqr)
+	boxplot_upper_fences[i, "fence_93"] <- q3 + (139.5*iqr)
+	boxplot_upper_fences[i, "fence_94"] <- q3 + (141*iqr)
+	boxplot_upper_fences[i, "fence_95"] <- q3 + (142.5*iqr)
+	boxplot_upper_fences[i, "fence_96"] <- q3 + (144*iqr)
+	boxplot_upper_fences[i, "fence_97"] <- q3 + (145.5*iqr)
+	boxplot_upper_fences[i, "fence_98"] <- q3 + (147*iqr)
+	boxplot_upper_fences[i, "fence_99"] <- q3 + (148.5*iqr)
+	boxplot_upper_fences[i, "fence_100"] <- q3 + (150*iqr)
+
+	boxplot_lower_fences[i, "q1"] <- q1
+	boxplot_lower_fences[i, "q3"] <- q3
+	boxplot_lower_fences[i, "iqr"] <- iqr
+
+	boxplot_lower_fences[i, "fence_1"] <- q1 - (1.5*iqr)
+	boxplot_lower_fences[i, "fence_2"] <- q1 - (3*iqr)
+	boxplot_lower_fences[i, "fence_3"] <- q1 - (4.5*iqr)
+	boxplot_lower_fences[i, "fence_4"] <- q1 - (6*iqr)
+	boxplot_lower_fences[i, "fence_5"] <- q1 - (7.5*iqr)
+	boxplot_lower_fences[i, "fence_6"] <- q1 - (9*iqr)
+	boxplot_lower_fences[i, "fence_7"] <- q1 - (10.5*iqr)
+	boxplot_lower_fences[i, "fence_8"] <- q1 - (12*iqr)
+	boxplot_lower_fences[i, "fence_9"] <- q1 - (13.5*iqr)
+	boxplot_lower_fences[i, "fence_10"] <- q1 - (15*iqr)
+	boxplot_lower_fences[i, "fence_11"] <- q1 - (16.5*iqr)
+	boxplot_lower_fences[i, "fence_12"] <- q1 - (18*iqr)
+	boxplot_lower_fences[i, "fence_13"] <- q1 - (19.5*iqr)
+	boxplot_lower_fences[i, "fence_14"] <- q1 - (21*iqr)
+	boxplot_lower_fences[i, "fence_15"] <- q1 - (22.5*iqr)
+	boxplot_lower_fences[i, "fence_16"] <- q1 - (24*iqr)
+	boxplot_lower_fences[i, "fence_17"] <- q1 - (25.5*iqr)
+	boxplot_lower_fences[i, "fence_18"] <- q1 - (27*iqr)
+	boxplot_lower_fences[i, "fence_19"] <- q1 - (28.5*iqr)
+	boxplot_lower_fences[i, "fence_20"] <- q1 - (30*iqr)
+	boxplot_lower_fences[i, "fence_21"] <- q1 - (31.5*iqr)
+	boxplot_lower_fences[i, "fence_22"] <- q1 - (33*iqr)
+	boxplot_lower_fences[i, "fence_23"] <- q1 - (34.5*iqr)
+	boxplot_lower_fences[i, "fence_24"] <- q1 - (36*iqr)
+	boxplot_lower_fences[i, "fence_25"] <- q1 - (37.5*iqr)
+	boxplot_lower_fences[i, "fence_26"] <- q1 - (39*iqr)
+	boxplot_lower_fences[i, "fence_27"] <- q1 - (40.5*iqr)
+	boxplot_lower_fences[i, "fence_28"] <- q1 - (42*iqr)
+	boxplot_lower_fences[i, "fence_29"] <- q1 - (43.5*iqr)
+	boxplot_lower_fences[i, "fence_30"] <- q1 - (45*iqr)
+	boxplot_lower_fences[i, "fence_31"] <- q1 - (46.5*iqr)
+	boxplot_lower_fences[i, "fence_32"] <- q1 - (48*iqr)
+	boxplot_lower_fences[i, "fence_33"] <- q1 - (49.5*iqr)
+	boxplot_lower_fences[i, "fence_34"] <- q1 - (51*iqr)
+	boxplot_lower_fences[i, "fence_35"] <- q1 - (52.5*iqr)
+	boxplot_lower_fences[i, "fence_36"] <- q1 - (54*iqr)
+	boxplot_lower_fences[i, "fence_37"] <- q1 - (55.5*iqr)
+	boxplot_lower_fences[i, "fence_38"] <- q1 - (57*iqr)
+	boxplot_lower_fences[i, "fence_39"] <- q1 - (58.5*iqr)
+	boxplot_lower_fences[i, "fence_40"] <- q1 - (60*iqr)
+	boxplot_lower_fences[i, "fence_41"] <- q1 - (61.5*iqr)
+	boxplot_lower_fences[i, "fence_42"] <- q1 - (63*iqr)
+	boxplot_lower_fences[i, "fence_43"] <- q1 - (64.5*iqr)
+	boxplot_lower_fences[i, "fence_44"] <- q1 - (66*iqr)
+	boxplot_lower_fences[i, "fence_45"] <- q1 - (67.5*iqr)
+	boxplot_lower_fences[i, "fence_46"] <- q1 - (69*iqr)
+	boxplot_lower_fences[i, "fence_47"] <- q1 - (70.5*iqr)
+	boxplot_lower_fences[i, "fence_48"] <- q1 - (72*iqr)
+	boxplot_lower_fences[i, "fence_49"] <- q1 - (73.5*iqr)
+	boxplot_lower_fences[i, "fence_50"] <- q1 - (75*iqr)
+	boxplot_lower_fences[i, "fence_51"] <- q1 - (76.5*iqr)
+	boxplot_lower_fences[i, "fence_52"] <- q1 - (78*iqr)
+	boxplot_lower_fences[i, "fence_53"] <- q1 - (79.5*iqr)
+	boxplot_lower_fences[i, "fence_54"] <- q1 - (81*iqr)
+	boxplot_lower_fences[i, "fence_55"] <- q1 - (82.5*iqr)
+	boxplot_lower_fences[i, "fence_56"] <- q1 - (84*iqr)
+	boxplot_lower_fences[i, "fence_57"] <- q1 - (85.5*iqr)
+	boxplot_lower_fences[i, "fence_58"] <- q1 - (87*iqr)
+	boxplot_lower_fences[i, "fence_59"] <- q1 - (88.5*iqr)
+	boxplot_lower_fences[i, "fence_60"] <- q1 - (90*iqr)
+	boxplot_lower_fences[i, "fence_61"] <- q1 - (91.5*iqr)
+	boxplot_lower_fences[i, "fence_62"] <- q1 - (93*iqr)
+	boxplot_lower_fences[i, "fence_63"] <- q1 - (94.5*iqr)
+	boxplot_lower_fences[i, "fence_64"] <- q1 - (96*iqr)
+	boxplot_lower_fences[i, "fence_65"] <- q1 - (97.5*iqr)
+	boxplot_lower_fences[i, "fence_66"] <- q1 - (99*iqr)
+	boxplot_lower_fences[i, "fence_67"] <- q1 - (100.5*iqr)
+	boxplot_lower_fences[i, "fence_68"] <- q1 - (102*iqr)
+	boxplot_lower_fences[i, "fence_69"] <- q1 - (103.5*iqr)
+	boxplot_lower_fences[i, "fence_70"] <- q1 - (105*iqr)
+	boxplot_lower_fences[i, "fence_71"] <- q1 - (106.5*iqr)
+	boxplot_lower_fences[i, "fence_72"] <- q1 - (108*iqr)
+	boxplot_lower_fences[i, "fence_73"] <- q1 - (109.5*iqr)
+	boxplot_lower_fences[i, "fence_74"] <- q1 - (111*iqr)
+	boxplot_lower_fences[i, "fence_75"] <- q1 - (112.5*iqr)
+	boxplot_lower_fences[i, "fence_76"] <- q1 - (114*iqr)
+	boxplot_lower_fences[i, "fence_77"] <- q1 - (115.5*iqr)
+	boxplot_lower_fences[i, "fence_78"] <- q1 - (117*iqr)
+	boxplot_lower_fences[i, "fence_79"] <- q1 - (118.5*iqr)
+	boxplot_lower_fences[i, "fence_80"] <- q1 - (120*iqr)
+	boxplot_lower_fences[i, "fence_81"] <- q1 - (121.5*iqr)
+	boxplot_lower_fences[i, "fence_82"] <- q1 - (123*iqr)
+	boxplot_lower_fences[i, "fence_83"] <- q1 - (124.5*iqr)
+	boxplot_lower_fences[i, "fence_84"] <- q1 - (126*iqr)
+	boxplot_lower_fences[i, "fence_85"] <- q1 - (127.5*iqr)
+	boxplot_lower_fences[i, "fence_86"] <- q1 - (129*iqr)
+	boxplot_lower_fences[i, "fence_87"] <- q1 - (130.5*iqr)
+	boxplot_lower_fences[i, "fence_88"] <- q1 - (132*iqr)
+	boxplot_lower_fences[i, "fence_89"] <- q1 - (133.5*iqr)
+	boxplot_lower_fences[i, "fence_90"] <- q1 - (135*iqr)
+	boxplot_lower_fences[i, "fence_91"] <- q1 - (136.5*iqr)
+	boxplot_lower_fences[i, "fence_92"] <- q1 - (138*iqr)
+	boxplot_lower_fences[i, "fence_93"] <- q1 - (139.5*iqr)
+	boxplot_lower_fences[i, "fence_94"] <- q1 - (141*iqr)
+	boxplot_lower_fences[i, "fence_95"] <- q1 - (142.5*iqr)
+	boxplot_lower_fences[i, "fence_96"] <- q1 - (144*iqr)
+	boxplot_lower_fences[i, "fence_97"] <- q1 - (145.5*iqr)
+	boxplot_lower_fences[i, "fence_98"] <- q1 - (147*iqr)
+	boxplot_lower_fences[i, "fence_99"] <- q1 - (148.5*iqr)
+	boxplot_lower_fences[i, "fence_100"] <- q1 - (150*iqr)
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_boxplot_upper_fences"), as.data.frame(boxplot_upper_fences), overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_boxplot_upper_fences change row_names ensembl varchar(15) primary key"))
+dbWriteTable(con, paste0(rnaseqExpName, "_boxplot_lower_fences"), as.data.frame(boxplot_lower_fences), overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_boxplot_lower_fences change row_names ensembl varchar(15) primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, boxplot_stats, i, q1, q3, iqr, boxplot_upper_fences, boxplot_lower_fences)
+```
+
+## 23. ts-score
+```{r, tsScore}
+# Be sure there are not NULL values into tpm table; that means, replace NULL by ZERO when necessary
+# Rounding percentage to 2 decimal places
+
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+tpm_values <- tpm_values[,order(colnames(tpm_values))] # Order tpm_values columns alphabetically
+
+# Prepare outputs
+cumTPMgene_values <- tpm_values
+cumTPMgene_pct <- tpm_values
+
+# Calculate ts-score
+for (i in 1:nrow(tpm_values)) {
+	tpm_values_ordered = tpm_values[i,order(tpm_values[i,])]
+	tpm_values_cumulative = cumsum(tpm_values_ordered)
+
+	sumTPMgene <- tpm_values_cumulative[length(tpm_values_cumulative)]
+
+	cumTPMgene_values[i,] = tpm_values_cumulative[order(names(tpm_values_cumulative))]
+	cumTPMgene_pct[i,] = round(((cumTPMgene_values[i,] / sumTPMgene) * 100), digits = 2)
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+# dbWriteTable(con, paste0(rnaseqExpName, "_cumTPMgene_values"), as.data.frame(cumTPMgene_values), overwrite = TRUE)
+# dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_cumTPMgene_values change row_names ensembl varchar(15) primary key"))
+
+dbWriteTable(con, paste0(rnaseqExpName, "_tsScore"), as.data.frame(cumTPMgene_pct), overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_tsScore change row_names ensembl varchar(15) primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, i, tpm_values_ordered, tpm_values_cumulative, sumTPMgene, cumTPMgene_values, cumTPMgene_pct)
+```
+
+## 24. TGE
+```{r, tge}
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+cumTPMgene_pct <- dbReadTable(con, paste0(rnaseqExpName, "_tsScore"))
+dbDisconnect(con)
+
+cumTPMgene_pct_values <- as.matrix(cumTPMgene_pct[,2:ncol(cumTPMgene_pct)])
+rownames(cumTPMgene_pct_values) <- cumTPMgene_pct[,1]
+
+# Prepare outputs
+tge <- matrix(data = NA, nrow = nrow(cumTPMgene_pct_values), ncol = 100)
+rownames(tge) <- rownames(cumTPMgene_pct_values)
+colnames(tge) <- c("tge1", "tge2", "tge3", "tge4", "tge5", "tge6", "tge7", "tge8", "tge9", "tge10", "tge11", "tge12", "tge13", "tge14", "tge15", "tge16", "tge17", "tge18", "tge19", "tge20", "tge21", "tge22", "tge23", "tge24", "tge25", "tge26", "tge27", "tge28", "tge29", "tge30", "tge31", "tge32", "tge33", "tge34", "tge35", "tge36", "tge37", "tge38", "tge39", "tge40", "tge41", "tge42", "tge43", "tge44", "tge45", "tge46", "tge47", "tge48", "tge49", "tge50", "tge51", "tge52", "tge53", "tge54", "tge55", "tge56", "tge57", "tge58", "tge59", "tge60", "tge61", "tge62", "tge63", "tge64", "tge65", "tge66", "tge67", "tge68", "tge69", "tge70", "tge71", "tge72", "tge73", "tge74", "tge75", "tge76", "tge77", "tge78", "tge79", "tge80", "tge81", "tge82", "tge83", "tge84", "tge85", "tge86", "tge87", "tge88", "tge89", "tge90", "tge91", "tge92", "tge93", "tge94", "tge95", "tge96", "tge97", "tge98", "tge99", "tge100")
+
+# Calculate TGE
+for (i in 1:nrow(cumTPMgene_pct_values)) {
+	# Percentage values
+	tge[i,1] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 1))
+	tge[i,2] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 2))
+	tge[i,3] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 3))
+	tge[i,4] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 4))
+	tge[i,5] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 5))
+	tge[i,6] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 6))
+	tge[i,7] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 7))
+	tge[i,8] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 8))
+	tge[i,9] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 9))
+	tge[i,10] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 10))
+	tge[i,11] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 11))
+	tge[i,12] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 12))
+	tge[i,13] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 13))
+	tge[i,14] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 14))
+	tge[i,15] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 15))
+	tge[i,16] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 16))
+	tge[i,17] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 17))
+	tge[i,18] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 18))
+	tge[i,19] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 19))
+	tge[i,20] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 20))
+	tge[i,21] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 21))
+	tge[i,22] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 22))
+	tge[i,23] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 23))
+	tge[i,24] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 24))
+	tge[i,25] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 25))
+	tge[i,26] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 26))
+	tge[i,27] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 27))
+	tge[i,28] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 28))
+	tge[i,29] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 29))
+	tge[i,30] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 30))
+	tge[i,31] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 31))
+	tge[i,32] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 32))
+	tge[i,33] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 33))
+	tge[i,34] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 34))
+	tge[i,35] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 35))
+	tge[i,36] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 36))
+	tge[i,37] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 37))
+	tge[i,38] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 38))
+	tge[i,39] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 39))
+	tge[i,40] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 40))
+	tge[i,41] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 41))
+	tge[i,42] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 42))
+	tge[i,43] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 43))
+	tge[i,44] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 44))
+	tge[i,45] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 45))
+	tge[i,46] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 46))
+	tge[i,47] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 47))
+	tge[i,48] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 48))
+	tge[i,49] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 49))
+	tge[i,50] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 50))
+	tge[i,51] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 51))
+	tge[i,52] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 52))
+	tge[i,53] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 53))
+	tge[i,54] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 54))
+	tge[i,55] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 55))
+	tge[i,56] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 56))
+	tge[i,57] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 57))
+	tge[i,58] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 58))
+	tge[i,59] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 59))
+	tge[i,60] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 60))
+	tge[i,61] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 61))
+	tge[i,62] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 62))
+	tge[i,63] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 63))
+	tge[i,64] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 64))
+	tge[i,65] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 65))
+	tge[i,66] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 66))
+	tge[i,67] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 67))
+	tge[i,68] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 68))
+	tge[i,69] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 69))
+	tge[i,70] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 70))
+	tge[i,71] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 71))
+	tge[i,72] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 72))
+	tge[i,73] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 73))
+	tge[i,74] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 74))
+	tge[i,75] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 75))
+	tge[i,76] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 76))
+	tge[i,77] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 77))
+	tge[i,78] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 78))
+	tge[i,79] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 79))
+	tge[i,80] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 80))
+	tge[i,81] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 81))
+	tge[i,82] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 82))
+	tge[i,83] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 83))
+	tge[i,84] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 84))
+	tge[i,85] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 85))
+	tge[i,86] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 86))
+	tge[i,87] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 87))
+	tge[i,88] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 88))
+	tge[i,89] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 89))
+	tge[i,90] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 90))
+	tge[i,91] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 91))
+	tge[i,92] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 92))
+	tge[i,93] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 93))
+	tge[i,94] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 94))
+	tge[i,95] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 95))
+	tge[i,96] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 96))
+	tge[i,97] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 97))
+	tge[i,98] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 98))
+	tge[i,99] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 99))
+	tge[i,100] <- length(which(sort(cumTPMgene_pct_values[i,]) <= 100))
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_tge"), as.data.frame(tge), overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_tge change row_names ensembl varchar(15) primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, cumTPMgene_pct, cumTPMgene_pct_values, i, tge)
+```
+
+## 25. TPM, o-score and ts-score only for outliers
+```{r, tpm_oScore_tsScore_outliers}
+# In this script, we are dealing only with upper inner outliers; that means, outliers table (outliers_values object) contains only upper inner outliers (to check, use "apply(outliers_values, 2, unique)")
+
+# Import o-score and ts-score tables from database
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+oScore <- dbReadTable(con, paste0(rnaseqExpName, "_oScore"))
+tsScore <- dbReadTable(con, paste0(rnaseqExpName, "_tsScore"))
+outliers <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_inner_fence"))
+outliers_IFOF <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_inner_outer_fences"))
+dbDisconnect(con)
+
+# Parse o-score and ts-score tables to matrix
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+oScore_values <- as.matrix(oScore[,2:ncol(oScore)])
+rownames(oScore_values) <- oScore[,1]
+
+tsScore_values <- as.matrix(tsScore[,2:ncol(tsScore)])
+rownames(tsScore_values) <- tsScore[,1]
+
+outliers_values <- as.matrix(outliers[,2:ncol(outliers)])
+rownames(outliers_values) <- outliers[,1]
+
+outliers_IFOF_values <- as.matrix(outliers_IFOF[,2:ncol(outliers_IFOF)])
+rownames(outliers_IFOF_values) <- outliers_IFOF[,1]
+
+# Remove lower inner outliers (i.e. replace by zero)
+outliers_values[which(outliers_values==-1)] <- 0
+
+outliers_IFOF_values[which(outliers_IFOF_values==-1)] <- 0
+outliers_IFOF_values[which(outliers_IFOF_values==-2)] <- 0
+
+# Get o-score and ts-score values only for outliers
+tpm_out <- ifelse(outliers_values==0, outliers_values, tpm_values)
+oScore_out <- ifelse(outliers_values==0, outliers_values, oScore_values)
+tsScore_out <- ifelse(outliers_values==0, outliers_values, tsScore_values)
+
+# Export tables oScore_out and tsScore_out
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con,
+             paste0(rnaseqExpName, "_tpm_outliers_inner_fence"),
+             as.data.frame(tpm_out),
+             overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_tpm_outliers_inner_fence change row_names ensembl varchar(15) primary key"))
+
+dbWriteTable(con,
+             paste0(rnaseqExpName, "_oScore_outliers_inner_fence"),
+             as.data.frame(oScore_out),
+             overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_oScore_outliers_inner_fence change row_names ensembl varchar(15) primary key"))
+
+dbWriteTable(con,
+             paste0(rnaseqExpName, "_tsScore_outliers_inner_fence"),
+             as.data.frame(tsScore_out),
+             overwrite = TRUE)
+dbGetQuery(con, paste0("alter table ", rnaseqExpName, "_tsScore_outliers_inner_fence change row_names ensembl varchar(15) primary key"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, oScore, oScore_values, tsScore, tsScore_values, outliers, outliers_values, outliers_IFOF, outliers_IFOF_values, tpm_out, oScore_out, tsScore_out)
+```
+
+## 26. HERD
+```{r, herd}
+for(i in 1:length(o_score_ts_score)){
+  o_score = o_score_ts_score[[i]][1]
+  ts_score = o_score_ts_score[[i]][2]
+  
+  # Import data
+  con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+  # gene_symbol <- dbGetQuery(con, "select ensembl,symbol from ensembl_79_95_genes_ids_names")
+  oScore <- dbReadTable(con, paste0(rnaseqExpName, "_oScore_outliers_inner_fence"))
+  tsScore <- dbReadTable(con, paste0(rnaseqExpName, "_tsScore_outliers_inner_fence"))
+  outliers_count_gene <- dbGetQuery(con, paste0("select ensembl,OutIF,OutOF,tissues_OutTotal from ", rnaseqExpName, "_outliers_count_per_gene"))
+  complement_status <- dbGetQuery(con, paste0("select ensembl,tests_result as complement_status from ", rnaseqExpName, "_tests_summary"))
+  dbDisconnect(con)
+
+  # Data parser
+  oScore_values <- as.matrix(oScore[,2:ncol(oScore)])
+  rownames(oScore_values) <- oScore[,1]
+  
+  tsScore_values <- as.matrix(tsScore[,2:ncol(tsScore)])
+  rownames(tsScore_values) <- tsScore[,1]
+
+  # Prepare output      
+  oScore_tsScore <- data.frame("ensembl" = outliers_count_gene$ensembl,
+                               "oScore" = rep(0, nrow(outliers_count_gene)),
+                               "tsScore" = rep(0, nrow(outliers_count_gene)),
+                               "OutIF" = outliers_count_gene$OutIF,
+                               "OutOF" = outliers_count_gene$OutOF,
+                               "goat_status" = rep(NA, nrow(outliers_count_gene)),
+                               "out_tissues" = outliers_count_gene$tissues_OutTotal,
+                               stringsAsFactors = FALSE)
+  
+  # oScore_tsScore <- merge(oScore_tsScore, gene_symbol, by = "ensembl")
+  oScore_tsScore <- merge(oScore_tsScore, complement_status, by = "ensembl")
+  
+  # HERD
+  oScore_values_logical <- oScore_values  > o_score
+  tsScore_values_logical <- tsScore_values  > ts_score
+  
+  oScore_tsScore[,"oScore"] <- apply(oScore_values_logical, 1, sum)
+  oScore_tsScore[,"tsScore"] <- apply(tsScore_values_logical, 1, sum)
+        
+  oScore_tsScore[which(oScore_tsScore$oScore < oScore_tsScore$tsScore & oScore_tsScore$oScore != 0), "goat_status"] <- "oa"
+  oScore_tsScore[which(oScore_tsScore$oScore < oScore_tsScore$tsScore & oScore_tsScore$oScore == 0 & oScore_tsScore$OutOF == 0), "goat_status"] <- "ng1"
+  oScore_tsScore[which(oScore_tsScore$oScore < oScore_tsScore$tsScore & oScore_tsScore$oScore == 0 & oScore_tsScore$OutIF == 0), "goat_status"] <- "ng2"
+  oScore_tsScore[which(oScore_tsScore$oScore < oScore_tsScore$tsScore & oScore_tsScore$oScore == 0 & oScore_tsScore$OutOF != 0 & oScore_tsScore$OutIF != 0), "goat_status"] <- "ng12"
+  oScore_tsScore[which(oScore_tsScore$oScore > oScore_tsScore$tsScore & oScore_tsScore$tsScore != 0), "goat_status"] <- "ts"
+  oScore_tsScore[which(oScore_tsScore$oScore > oScore_tsScore$tsScore & oScore_tsScore$tsScore == 0), "goat_status"] <- NA # This case does not occur in pratice!
+  oScore_tsScore[which(oScore_tsScore$oScore == oScore_tsScore$tsScore & oScore_tsScore$oScore == 0 & oScore_tsScore$tsScore == 0), "goat_status"] <- "ng0" # These genes are not outliers in any tissue
+  oScore_tsScore[which(oScore_tsScore$oScore == oScore_tsScore$tsScore & oScore_tsScore$oScore != 0 & oScore_tsScore$tsScore !=0), "goat_status"] <- "oa_ts"
+  oScore_tsScore[which(is.na(oScore_tsScore$oScore)), "goat_status"] <- "ts" # Cases for whose IQR is zero and, therefore, o-score is not applicable
+  
+  goat_index <- as.data.frame(which(oScore_values_logical==TRUE & tsScore_values_logical==TRUE | is.na(oScore_values_logical) & tsScore_values_logical==TRUE, arr.ind = TRUE), stringsAsFactors = FALSE)
+  goat_index[,"ensembl"] <- rownames(tsScore_values_logical)[goat_index$row]
+  goat_index[,"goat_tissues"] <- colnames(tsScore_values_logical)[goat_index$col]
+  goat_values <- aggregate(goat_index$goat_tissues, list(goat_index$ensembl), paste, collapse = ", ")
+  colnames(goat_values) <- c("ensembl", "goat_tissues")
+  
+  oScore_tsScore <- merge(oScore_tsScore, goat_values, by = "ensembl", all = TRUE)
+  
+  # oScore_tsScore <- oScore_tsScore[,c("ensembl", "symbol", "oScore", "tsScore", "OutIF", "OutOF", "goat_status", "goat_tissues", "out_tissues", "complement_status")]
+  oScore_tsScore <- oScore_tsScore[,c("ensembl", "oScore", "tsScore", "OutIF", "OutOF", "goat_status", "goat_tissues", "out_tissues", "complement_status")]
+  oScore_tsScore[which(is.na(oScore_tsScore$goat_tissues)),"goat_tissues"] <- "None"
+  
+  # Export data
+  con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+  dbWriteTable(con,
+               paste0(rnaseqExpName, "_oScore", o_score, "_tsScore", ts_score),
+               oScore_tsScore,
+               row.names = FALSE,
+               # field.types = c(ensembl = "varchar(15) primary key", symbol = "varchar(30)", oScore = "tinyint", tsScore = "tinyint", OutIF = "tinyint", OutOF = "tinyint", goat_status = "varchar(10)", goat_tissues = "varchar(1000)", out_tissues = "varchar(1000)", complement_status = "varchar(15)"),
+               field.types = c(ensembl = "varchar(15) primary key", oScore = "tinyint", tsScore = "tinyint", OutIF = "tinyint", OutOF = "tinyint", goat_status = "varchar(10)", goat_tissues = "varchar(1000)", out_tissues = "varchar(1000)", complement_status = "varchar(15)"),
+               overwrite = TRUE)
+  dbDisconnect(con)
+  
+  # Delete local variables
+  rm(o_score, ts_score, con, gene_symbol, oScore, oScore_values, oScore_values_logical, tsScore, tsScore_values, tsScore_values_logical, outliers_count_gene, complement_status, goat_index, goat_values, oScore_tsScore)
+}
+
+rm(i)
+```
+
+## 27. Kurtosis and Skewness
+```{r, kurtosis_skewness}
+# The algorithm for computing kurtosis/skewness is type 3 (default); that means, kurtosis/skewness is centered on zero (zero is the kurtosis/skewness of the normal distribution)
+
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+if(consideringOutliers == "no"){
+ outliers <- dbReadTable(con, paste0(rnaseqExpName, "_outliers_", fence, "_fence"), row.names = "ensembl")
+}
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+if(consideringOutliers == "no"){
+  outliers <- as.matrix(outliers)
+  tpm_values[which(outliers != 0)] <- NA
+}
+
+# Prepare outputs
+kurtosis_values <- cbind(as.character(tpm[,1]), rep(0,nrow(tpm)))
+colnames(kurtosis_values) <- c("ensembl", "kurtosis")
+
+skewness_values <- cbind(as.character(tpm[,1]), rep(0,nrow(tpm)))
+colnames(skewness_values) <- c("ensembl", "skewness")
+
+# Kurtosis and Skewness
+for(i in 1:nrow(tpm)){
+  kurtosis_values[i,2] <- kurtosis(tpm_values[i,], na.rm = TRUE)
+  skewness_values[i,2] <- skewness(tpm_values[i,], na.rm = TRUE)
+}
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+if(consideringOutliers == "yes"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_kurtosis"), as.data.frame(kurtosis_values), row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", kurtosis = "float"), overwrite = TRUE)
+  dbWriteTable(con, paste0(rnaseqExpName, "_skewness"), as.data.frame(skewness_values), row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", skewness = "float"), overwrite = TRUE)
+}
+if(consideringOutliers == "no"){
+  dbWriteTable(con, paste0(rnaseqExpName, "_kurtosis_without_outliers_", fence, "_fence"), as.data.frame(kurtosis_values), row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", kurtosis = "float"), overwrite = TRUE)
+  dbWriteTable(con, paste0(rnaseqExpName, "_skewness_without_outliers_", fence, "_fence"), as.data.frame(skewness_values), row.names = FALSE, field.types = c(ensembl = "varchar(15) primary key", skewness = "float"), overwrite = TRUE)
+}
+dbDisconnect(con)
+
+# Delete local variables
+rm(con, tpm, tpm_values, outliers, kurtosis_values, skewness_values, i)
+```
+
+## 28. Kurtosis and Skewness summary
+```{r, kurtosis_skewness_summary}
+# Both kurtosis and skewness of genes whose were not avaliated in the normality test are NULL at the moment
+
+# SQL queries
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+
+# Kurtosis
+dbGetQuery(con, paste0("create table ", rnaseqExpName, "_kurtosis_summary
+select e.*,f.sw_result
+from
+(select c.*,d.kurtosis as kurtosis_without_outOF
+from
+(select a.*,b.kurtosis as kurtosis_without_outIF
+from
+(select * from ", rnaseqExpName, "_kurtosis) a
+join
+(select * from ", rnaseqExpName, "_kurtosis_without_outliers_inner_fence) b
+on a.ensembl=b.ensembl) c
+join
+(select * from ", rnaseqExpName, "_kurtosis_without_outliers_outer_fence) d
+on c.ensembl=d.ensembl) e
+join
+(select * from ", rnaseqExpName, "_tests_summary) f
+on e.ensembl=f.ensembl;"))
+
+dbGetQuery(con, paste0("ALTER TABLE ", rnaseqExpName, "_kurtosis_summary
+ADD COLUMN kurtosis_result float;"))
+
+dbGetQuery(con, paste0("UPDATE ", rnaseqExpName, "_kurtosis_summary
+SET kurtosis_result = kurtosis
+WHERE sw_result = 'pG';"))
+
+dbGetQuery(con, paste0("UPDATE ", rnaseqExpName, "_kurtosis_summary
+SET kurtosis_result = kurtosis_without_outIF
+WHERE sw_result <> 'pG';"))
+
+# Skewness
+dbGetQuery(con, paste0("create table ", rnaseqExpName, "_skewness_summary
+select e.*,f.sw_result
+from
+(select c.*,d.skewness as skewness_without_outOF
+from
+(select a.*,b.skewness as skewness_without_outIF
+from
+(select * from ", rnaseqExpName, "_skewness) a
+join
+(select * from ", rnaseqExpName, "_skewness_without_outliers_inner_fence) b
+on a.ensembl=b.ensembl) c
+join
+(select * from ", rnaseqExpName, "_skewness_without_outliers_outer_fence) d
+on c.ensembl=d.ensembl) e
+join
+(select * from ", rnaseqExpName, "_tests_summary) f
+on e.ensembl=f.ensembl;"))
+
+dbGetQuery(con, paste0("ALTER TABLE ", rnaseqExpName, "_skewness_summary
+ADD COLUMN skewness_result float;"))
+
+dbGetQuery(con, paste0("UPDATE ", rnaseqExpName, "_skewness_summary
+SET skewness_result = skewness
+WHERE sw_result = 'pG';"))
+
+dbGetQuery(con, paste0("UPDATE ", rnaseqExpName, "_skewness_summary
+SET skewness_result = skewness_without_outIF
+WHERE sw_result <> 'pG';"))
+dbDisconnect(con)
+
+# Delete local variables
+rm(con)
+```
+
+## 29. GTE50
+```{r, gte50}
+# Rounding gte50 to integer number
+
+# Import data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tpm <- dbReadTable(con, paste0(rnaseqExpName, "_tpm"))
+dbDisconnect(con)
+
+# Data parser
+tpm_values <- as.matrix(tpm[,2:ncol(tpm)])
+rownames(tpm_values) <- tpm[,1]
+
+# Prepare output
+gte50 <- as.data.frame(cbind(colnames(tpm_values), rep(NA, ncol(tpm_values))))
+colnames(gte50) = c("tissue", "gte50")
+gte50$tissue = as.character(gte50$tissue)
+gte50$gte50 = as.numeric(gte50$gte50)
+
+cumulative <- as.data.frame(cbind(tpm_values, "genes_count" = seq.int(1, NROW(tpm_values), 1)), stringsAsFactors = FALSE)
+
+# GTE50
+interpolation <- function(x, x1, x2, y1, y2){
+  y = y1 + (((x - x1)/(x2 - x1))*(y2 - y1))
+}
+
+for(i in 1:ncol(tpm_values)){
+  tpm_values_ordered = tpm_values[order(-tpm_values[,i]),i]
+  tpm_values_cumulative = cumsum(tpm_values_ordered)
+
+  index <- length(which(tpm_values_cumulative <= 500000))
+    if(tpm_values_cumulative[index] == 500000){
+      genes = index
+    }else{
+      x1 <- tpm_values_cumulative[index]
+      x2 <- tpm_values_cumulative[index+1]
+      y1 <- index
+      y2 <- index+1
+      x = 500000
+      genes = interpolation(x, x1, x2, y1, y2)
+      names(genes) = NULL
+    }
+  gte50[i,2] <- round(genes)
+  cumulative[,i] <- tpm_values_cumulative
+}
+
+# gte50 = gte50[order(gte50$gte50),]
+
+# Export data
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+dbWriteTable(con, paste0(rnaseqExpName, "_gte50"), gte50, row.names = FALSE, field.types = c(tissue = paste0("varchar(", max(nchar(gte50[,"tissue"])), ") primary key"), gte50 = "float"), overwrite = TRUE)
+dbDisconnect(con)
+
+# Delete local variables
+rm(tpm, tpm_values, con, tpm_values_ordered, tpm_values_cumulative, gte50, interpolation, i, index, genes, x, x1, x2, y1, y2, cumulative)
+```
+
+## 30. Tables check
+```{r, tables_check, eval = FALSE, purl=FALSE}
+# This script is not completely finished, then we do not recommend to run it
+
+# tpm
+# Get tissues names
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+tissues <- dbGetQuery(con, paste0("select COLUMN_NAME from information_schema.COLUMNS where TABLE_SCHEMA = '", database, "' and TABLE_NAME = '", rnaseqExpName, "_tpm';"))
+dbDisconnect(con)
+
+tissues <- tissues[which(tissues != c("ensembl", "Gene_ID", "symbol", "Gene_Name")),]
+
+# Count all zero rows (= no expressed genes) => Expected: 0 (zero)
+zeroRowsQuery <- paste0(tissues, collapse = "=0 and ")
+zeroRowsQuery <- paste0("select count(*) as zeroRowsResult from ", rnaseqExpName, "_tpm where ", zeroRowsQuery, "=0;")
+
+# Column sum is equal to 10e6? => Expected: Yes
+columnSumQuery <- data.frame("1stTerm" = rep("sum(", length(tissues)), "2ndTerm" = tissues, "3rdTerm" = rep(") as ", length(tissues)), "4thTerm" = tissues, "5thTerm" = rep(", ", length(tissues)), stringsAsFactors = FALSE)
+columnSumQuery <- paste0(columnSumQuery$X1stTerm,columnSumQuery$X2ndTerm,columnSumQuery$X3rdTerm,columnSumQuery$X4thTerm,columnSumQuery$X5thTerm, collapse = "")
+columnSumQuery <- paste0("select ", columnSumQuery, "from ", rnaseqExpName, "_tpm;")
+columnSumQuery <- gsub(paste0(", from ", rnaseqExpName, "_tpm;"), paste0(" from ", rnaseqExpName, "_tpm;"), columnSumQuery)
+  
+# Report
+con <- dbConnect(MySQL(), group = "clientother", dbname = database)
+zeroRowsResult <- dbGetQuery(con, zeroRowsQuery)
+columnSumResult <- dbGetQuery(con, columnSumQuery)
+dbDisconnect(con)
+
+print(paste0(rnaseqExpName, " tpm table check"))
+print("This module aims to check tpm table as all the other tables in the database depends on it.")
+print("Zero rows: Checks for all zero rows (= no expressed genes). The Reference value is 0 (zero).")
+print(paste0("Zero rows count: ", zeroRowsResult))
+if(zeroRowsResult==0){
+  print("Zero rows status: ok")
+}else{
+  print("Zero rows status: Zero rows count differs from Reference; please check")
+}
+print(paste0("Column sum: Checks if the column (= tissue) adds up to 10e6 as expected for tpm values. The Reference value for ", rnaseqExpName, " is ", length(tissues), " (total number of tissues in ", rnaseqExpName, " dataset)."))
+print(paste0("Column sum count: ", sum(columnSumResult>=999798)))
+if(sum(columnSumResult>=999798) == length(tissues)){
+  print("Column sum status: ok")
+}else{
+  print("Column sum status: Column sum differs from Reference; please check")
+}
+
+# Delete local variables
+rm(con, tissues, zeroRowsQuery, columnSumQuery, zeroRowsResult, columnSumResult)
+```
+
+## 31. Session information
+```{r, session_information}
+sessionInfo()
+```
+
+## 32. Remove pipeline variables
+```{r, rm_pipeline_variables}
+# R
+rm(list = ls())
+
+# bash
+Sys.unsetenv(c("rnaseqExpName", "rnaseqExpCode", "rnaseqExpDir"))
+```
